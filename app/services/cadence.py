@@ -1,20 +1,24 @@
-"""Mode Single & Mode Intervalle cadence runners.
+"""Cadence runner — mode intervalle uniquement.
 
-Lifecycle of `sessions.status` driven by this module:
-    Single   : pending -> waiting_first -> waiting_second -> completed
-    Interval : pending -> (waiting_first -> waiting_second -> paused)+ -> stopped
-    Both     : on cancel  -> stopped
-               on error   -> failed
+Lifecycle of `sessions.status`:
+    pending -> (measuring -> paused)+ -> stopped
+    on cancel  -> stopped
+    on error   -> failed
 
-The OPM math (delta_seconds, opm, completed_at) is computed by the SQL trigger
-`compute_iteration_metrics` when we UPDATE t1 — Python only writes timestamps.
-Anomaly detection (is_anomaly, anomaly_deviation) is computed in Python after
-each iteration completes, comparing the iteration's OPM to the average of the
-previously completed iterations in the same session.
+Pour chaque cycle :
+    1. Ouvre le flux pendant `measurement_window_seconds`.
+    2. Collecte les timestamps de tous les franchissements de la ligne.
+    3. Calcule la moyenne des écarts consécutifs (t1-t0, t2-t1, ...).
+    4. UPDATE l'itération avec object_count + avg_delta_seconds ; le trigger SQL
+       `compute_iteration_metrics` calcule opm = 60 / avg_delta_seconds.
+    5. Détecte une anomalie en comparant l'OPM à la moyenne des itérations passées.
+    6. Pause `interval_minutes` minutes, puis recommence.
 
-Runners live in an in-process registry. A worker restart loses them; the
-corresponding session row will remain in waiting_*/paused until some external
-cleanup re-marks it. Known limitation of the v1 single-worker deployment."""
+On ne stocke pas les timestamps bruts en base — uniquement la moyenne agrégée.
+
+Les runners vivent dans un registre in-process. Un redémarrage worker les perd ;
+les sessions concernées restent en `measuring`/`paused` jusqu'à un nettoyage
+externe. Limitation connue du déploiement v1 (single-worker)."""
 from __future__ import annotations
 
 import asyncio
@@ -24,23 +28,23 @@ from uuid import UUID
 
 from supabase import Client
 
-from app.models.common import CrossingType, SessionMode, SessionStatus
+from app.models.common import CadenceStatus, SessionStatus
 from app.services.detection import Detection, YoloDetector
+from app.services.mqtt_publisher import publish_cadence_iteration
 from app.services.stream import RTSPStream, StreamUnavailable
-from app.services.tracking import CrossingEvent, LineCrosser
+from app.services.tracking import LineCrosser
 
-# `stream` is imported first so its `OPENCV_FFMPEG_CAPTURE_OPTIONS` env var is
-# set before cv2 is referenced anywhere else in the process.
+# `stream` est importé en premier pour que sa var d'env
+# `OPENCV_FFMPEG_CAPTURE_OPTIONS` soit posée avant le premier import de cv2.
 import cv2  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# BGR colors used for the live overlay sent to the preview WebSocket.
-_LINE_COLOR = (0, 255, 255)         # yellow — trigger line
-_BOX_NEW = (80, 220, 100)           # green — tracked, not yet crossed
-_BOX_COUNTED = (160, 160, 160)      # gray  — already counted in this iteration
-_TEXT_FG = (0, 255, 255)            # yellow text
-_TEXT_OUTLINE = (0, 0, 0)           # black outline for legibility
+_LINE_COLOR = (0, 255, 255)         # jaune — ligne de trigger
+_BOX_NEW = (80, 220, 100)           # vert — tracké, pas encore compté
+_BOX_COUNTED = (160, 160, 160)      # gris — déjà compté dans cette itération
+_TEXT_FG = (0, 255, 255)
+_TEXT_OUTLINE = (0, 0, 0)
 
 
 def compute_anomaly(
@@ -48,10 +52,10 @@ def compute_anomaly(
     baseline_opms: list[float],
     threshold_pct: float,
 ) -> tuple[bool, float] | None:
-    """Pure helper: is `current_opm` an anomaly vs the average of `baseline_opms`?
+    """Pure helper : `current_opm` est-il une anomalie vs la moyenne des `baseline_opms` ?
 
-    Returns (is_anomaly, deviation_pct) or None when there is no baseline
-    yet (first iteration, or all baselines are non-positive)."""
+    Retourne (is_anomaly, deviation_pct) ou None s'il n'y a pas encore de baseline
+    (première itération, ou tous les baselines non positifs)."""
     if not baseline_opms:
         return None
     avg = sum(baseline_opms) / len(baseline_opms)
@@ -61,46 +65,98 @@ def compute_anomaly(
     return deviation_pct > threshold_pct, round(deviation_pct, 2)
 
 
+def compute_avg_delta_seconds(timestamps: list[datetime]) -> float | None:
+    """Moyenne des écarts consécutifs entre franchissements, en secondes.
+
+    Retourne None si moins de 2 franchissements (pas d'écart calculable)."""
+    if len(timestamps) < 2:
+        return None
+    deltas = [
+        (timestamps[i] - timestamps[i - 1]).total_seconds()
+        for i in range(1, len(timestamps))
+    ]
+    return sum(deltas) / len(deltas)
+
+
+def compute_cadence_status(
+    opm: float | None,
+    ref_min: float | None,
+    ref_max: float | None,
+) -> CadenceStatus | None:
+    """Compare un OPM à la plage de référence de la session.
+
+    Retourne None si l'OPM ou la plage est manquant (pas de comparaison
+    possible). Sinon : BELOW (< min), NORMAL (min ≤ opm ≤ max) ou ABOVE (> max)."""
+    if opm is None or ref_min is None or ref_max is None:
+        return None
+    if opm < ref_min:
+        return CadenceStatus.BELOW
+    if opm > ref_max:
+        return CadenceStatus.ABOVE
+    return CadenceStatus.NORMAL
+
+
 class SessionRunner:
-    """Drives a cadence measurement to completion (Single) or until the
-    operator stops it (Interval)."""
+    """Drives a cadence measurement session jusqu'à un /stop manuel."""
 
     def __init__(
         self,
         session_id: UUID,
         camera_id: UUID,
         stream_url: str,
-        mode: SessionMode,
         trigger_line_position: float,
         yolo_confidence: float,
         yolo_model: str,
         db: Client,
-        interval_minutes: int | None = None,
+        interval_minutes: int,
+        measurement_window_seconds: int = 120,
         anomaly_threshold_pct: float = 15.0,
+        reference_cadence_min: float | None = None,
+        reference_cadence_max: float | None = None,
         target_fps: int = 10,
         preview_jpeg_quality: int = 70,
+        # Méta MQTT alignée sur la convention de l'équipe IoT Miniros
+        # (topic `Miniros/{factory}/{line}/{machine}/...`). Si None, les
+        # fallbacks de settings sont utilisés au build du topic.
+        mqtt_factory: str | None = None,
+        mqtt_line: str | None = None,
+        mqtt_machine: str | None = None,
     ) -> None:
-        if mode == SessionMode.INTERVAL and (
-            interval_minutes is None or interval_minutes <= 0
+        if interval_minutes <= 0:
+            raise ValueError("interval_minutes must be > 0")
+        if measurement_window_seconds <= 0:
+            raise ValueError("measurement_window_seconds must be > 0")
+        if (reference_cadence_min is None) != (reference_cadence_max is None):
+            raise ValueError(
+                "reference_cadence_min and reference_cadence_max must be both set or both None"
+            )
+        if (
+            reference_cadence_min is not None
+            and reference_cadence_max is not None
+            and reference_cadence_min > reference_cadence_max
         ):
-            raise ValueError("interval_minutes is required for INTERVAL mode")
+            raise ValueError("reference_cadence_min must be <= reference_cadence_max")
         self.session_id = session_id
         self.camera_id = camera_id
         self.stream_url = stream_url
-        self.mode = mode
         self.trigger_line_position = trigger_line_position
         self.yolo_confidence = yolo_confidence
         self.yolo_model = yolo_model
         self.db = db
         self.interval_minutes = interval_minutes
+        self.measurement_window_seconds = measurement_window_seconds
         self.anomaly_threshold_pct = anomaly_threshold_pct
+        self.reference_cadence_min = reference_cadence_min
+        self.reference_cadence_max = reference_cadence_max
         self.target_fps = target_fps
         self.preview_jpeg_quality = max(10, min(preview_jpeg_quality, 95))
+        self.mqtt_factory = mqtt_factory
+        self.mqtt_line = mqtt_line
+        self.mqtt_machine = mqtt_machine
 
         self._task: asyncio.Task | None = None
         self._stop_requested = False
-        # Annotated JPEG of the most recent frame, consumed by the preview
-        # WebSocket when this runner is the active owner of the camera.
+        # Dernier JPEG annoté, consommé par le WebSocket de preview.
         self._latest_frame: bytes | None = None
 
     @property
@@ -122,15 +178,12 @@ class SessionRunner:
         return self._task
 
     # ------------------------------------------------------------------
-    # Top-level dispatch
+    # Boucle principale
     # ------------------------------------------------------------------
 
     async def _run(self) -> None:
         try:
-            if self.mode == SessionMode.SINGLE:
-                await self._run_single()
-            else:
-                await self._run_interval()
+            await self._run_interval()
         except asyncio.CancelledError:
             await self._mark_stopped()
             raise
@@ -146,47 +199,87 @@ class SessionRunner:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    # Mode handlers
-    # ------------------------------------------------------------------
-
-    async def _run_single(self) -> None:
-        detector = YoloDetector(self.yolo_model)
-        crosser = LineCrosser(self.trigger_line_position)
-        stream = RTSPStream(self.stream_url, target_fps=self.target_fps)
-        try:
-            iteration_id = await self._create_iteration(1)
-            await self._update_session({"status": SessionStatus.WAITING_FIRST.value})
-            await self._do_one_iteration(stream, detector, crosser, iteration_id)
-            await self._update_session(
-                {
-                    "status": SessionStatus.COMPLETED.value,
-                    "ended_at": _now_iso(),
-                }
-            )
-        finally:
-            await stream.close()
-
     async def _run_interval(self) -> None:
-        assert self.interval_minutes is not None  # ctor enforces
+        print(f">>> RUNNER START session={self.session_id} stream={self.stream_url}", flush=True)
         iteration_number = 0
         while not self._stop_requested:
             iteration_number += 1
+            print(f">>> ITER {iteration_number} START", flush=True)
 
-            # Fresh detector + crosser per iteration: ultralytics' ByteTrack
-            # persists tracker state across calls, so a new instance is the
-            # simplest way to guarantee fresh IDs after the pause.
+            # Nouveau détecteur + crosser par itération : ByteTrack persiste son
+            # état entre appels, repartir à zéro garantit des IDs propres après
+            # la pause.
             detector = YoloDetector(self.yolo_model)
             crosser = LineCrosser(self.trigger_line_position)
             stream = RTSPStream(self.stream_url, target_fps=self.target_fps)
             iteration_id = await self._create_iteration(iteration_number)
+
+            await self._update_session({"status": SessionStatus.MEASURING.value})
+            measurement_start = _utcnow()
+            await self._update_iteration(
+                iteration_id,
+                {"measurement_started_at": measurement_start.isoformat()},
+            )
+
+            print(
+                f"[session {self.session_id} iter {iteration_number}] "
+                f"window opened ({self.measurement_window_seconds}s) — "
+                f"collecting crossings…",
+                flush=True,
+            )
             try:
-                await self._update_session(
-                    {"status": SessionStatus.WAITING_FIRST.value}
+                timestamps = await self._collect_window(
+                    stream, detector, crosser, measurement_start, iteration_number
                 )
-                await self._do_one_iteration(stream, detector, crosser, iteration_id)
             finally:
                 await stream.close()
+
+            measurement_end = _utcnow()
+            avg_delta = compute_avg_delta_seconds(timestamps)
+            # On calcule l'OPM côté Python pour pouvoir l'utiliser tout de
+            # suite dans la comparaison de plage. Le trigger SQL recalcule
+            # ensuite la même valeur (no-op).
+            opm: float | None = (
+                round(60.0 / avg_delta, 2)
+                if avg_delta is not None and avg_delta > 0
+                else None
+            )
+            cadence_status = compute_cadence_status(
+                opm, self.reference_cadence_min, self.reference_cadence_max
+            )
+            self._log_window_summary(
+                iteration_number, timestamps, avg_delta, opm, cadence_status
+            )
+            await self._update_iteration(
+                iteration_id,
+                {
+                    "measurement_ended_at": measurement_end.isoformat(),
+                    "object_count": len(timestamps),
+                    "avg_delta_seconds": avg_delta,  # déclenche le calcul de opm
+                    "cadence_status": (
+                        cadence_status.value if cadence_status is not None else None
+                    ),
+                },
+            )
+
+            # Envoi MQTT vers Odoo de la cadence moyenne calculée sur la
+            # fenêtre qui vient de se terminer. Best-effort : si MQTT est
+            # désactivé / broker injoignable, l'appel est silencieux.
+            publish_cadence_iteration(
+                factory=self.mqtt_factory,
+                line=self.mqtt_line,
+                machine=self.mqtt_machine,
+                session_id=self.session_id,
+                iteration_number=iteration_number,
+                cadence_moyenne=opm,
+                temps_debut=measurement_start,
+                temps_fin=measurement_end,
+                object_count=len(timestamps),
+                avg_delta_seconds=avg_delta,
+                cadence_status=(
+                    cadence_status.value if cadence_status is not None else None
+                ),
+            )
 
             await self._compute_anomaly_for(iteration_id)
 
@@ -204,55 +297,107 @@ class SessionRunner:
         )
 
     # ------------------------------------------------------------------
-    # Shared per-iteration frame loop
+    # Collecte sur une fenêtre
     # ------------------------------------------------------------------
 
-    async def _do_one_iteration(
+    async def _collect_window(
         self,
         stream: RTSPStream,
         detector: YoloDetector,
         crosser: LineCrosser,
-        iteration_id: UUID,
-    ) -> None:
-        t0_recorded = False
+        window_start: datetime,
+        iteration_number: int,
+    ) -> list[datetime]:
+        print(f">>> WINDOW OPEN iter={iteration_number} (line={self.trigger_line_position})", flush=True)
+        deadline = window_start.timestamp() + self.measurement_window_seconds
+        timestamps: list[datetime] = []
+        frame_count = 0
+
         async for frame in stream.raw_frames():
             if self._stop_requested:
-                return
+                return timestamps
+            if _utcnow().timestamp() >= deadline:
+                return timestamps
 
             detections = await detector.track(frame, self.yolo_confidence)
             events = crosser.update(detections, frame.shape[1])
 
-            # Update the preview buffer with the annotated frame. This is what
-            # the WS preview consumes when a session owns the camera.
             self._latest_frame = self._encode_annotated(
                 frame, detections, crosser.crossed_ids
             )
 
+            frame_count += 1
+            # Heartbeat toutes les ~30 frames pour confirmer que le runner tourne
+            if frame_count % 30 == 0:
+                print(
+                    f"... frame={frame_count} detections={len(detections)} "
+                    f"crossings={len(timestamps)}",
+                    flush=True,
+                )
+
             for event in events:
-                if not t0_recorded:
-                    await self._record_event(event, CrossingType.T0, iteration_id)
-                    await self._update_iteration(
-                        iteration_id, {"t0": event.timestamp.isoformat()}
-                    )
-                    await self._update_session(
-                        {"status": SessionStatus.WAITING_SECOND.value}
-                    )
-                    t0_recorded = True
-                else:
-                    await self._record_event(event, CrossingType.T1, iteration_id)
-                    # Setting t1 fires the compute_iteration_metrics trigger
-                    # which fills delta_seconds + opm + completed_at.
-                    await self._update_iteration(
-                        iteration_id, {"t1": event.timestamp.isoformat()}
-                    )
-                    return
+                idx = len(timestamps)
+                timestamps.append(event.timestamp)
+                print(f"t{idx} = {event.timestamp.isoformat(timespec='milliseconds')}", flush=True)
+
+        return timestamps
+
+    # ------------------------------------------------------------------
+    # Logging du calcul
+    # ------------------------------------------------------------------
+
+    def _log_window_summary(
+        self,
+        iteration_number: int,
+        timestamps: list[datetime],
+        avg_delta: float | None,
+        opm: float | None,
+        cadence_status: CadenceStatus | None,
+    ) -> None:
+        n = len(timestamps)
+        tag = f"[session {self.session_id} iter {iteration_number}]"
+        range_str = (
+            f" ref=[{self.reference_cadence_min}, {self.reference_cadence_max}]"
+            if self.reference_cadence_min is not None
+            else ""
+        )
+        status_str = (
+            f" status={cadence_status.value.upper()}"
+            if cadence_status is not None
+            else ""
+        )
+        if n < 2:
+            print(
+                f"{tag} window closed: {n} object(s) — pas assez pour un delta, "
+                f"opm = NULL{range_str}",
+                flush=True,
+            )
+            return
+        deltas = [
+            (timestamps[i] - timestamps[i - 1]).total_seconds()
+            for i in range(1, n)
+        ]
+        deltas_str = ", ".join(f"{d:.3f}" for d in deltas)
+        if opm is not None:
+            print(
+                f"{tag} window closed: {n} objects | deltas (s) = [{deltas_str}] | "
+                f"avg_delta = {avg_delta:.3f}s -> opm = {opm:.2f}"
+                f"{range_str}{status_str}",
+                flush=True,
+            )
+        else:
+            print(
+                f"{tag} window closed: {n} objects | deltas (s) = [{deltas_str}] | "
+                f"avg_delta = {avg_delta} -> opm = NULL{range_str}",
+                flush=True,
+            )
 
     # ------------------------------------------------------------------
     # Anomaly detection
     # ------------------------------------------------------------------
 
     async def _compute_anomaly_for(self, iteration_id: UUID) -> None:
-        # opm is null if the iteration was stopped before T1 — skip silently.
+        # opm est NULL si l'itération n'a pas eu assez d'objets — skip.
         cur_q = (
             self.db.table("session_iterations")
             .select("opm")
@@ -305,19 +450,15 @@ class SessionRunner:
         detections: list[Detection],
         crossed_ids: set[int],
     ) -> bytes | None:
-        """Draw the trigger line + tracked boxes on a copy of the frame and
-        return a JPEG-encoded byte string ready for base64 / WebSocket."""
         try:
             out = frame.copy()
             h, w = out.shape[:2]
 
-            # Trigger line + position label
             line_x = int(w * self.trigger_line_position)
             cv2.line(out, (line_x, 0), (line_x, h), _LINE_COLOR, 2, cv2.LINE_AA)
             pct = f"{self.trigger_line_position * 100:.0f}%"
             self._put_label(out, pct, (line_x + 6, 22))
 
-            # Detection boxes
             for d in detections:
                 x1, y1, x2, y2 = (int(v) for v in d.bbox)
                 color = (
@@ -339,7 +480,6 @@ class SessionRunner:
             )
             return bytes(jpeg) if ok else None
         except Exception:
-            # Annotation is best-effort — never let a draw error stop the runner.
             logger.exception("annotate failed")
             return None
 
@@ -369,30 +509,6 @@ class SessionRunner:
             .update(data)
             .eq("id", str(iteration_id))
         )
-        await asyncio.to_thread(q.execute)
-
-    async def _record_event(
-        self,
-        event: CrossingEvent,
-        crossing: CrossingType,
-        iteration_id: UUID,
-    ) -> None:
-        d = event.detection
-        payload = {
-            "session_id": str(self.session_id),
-            "iteration_id": str(iteration_id),
-            "crossing": crossing.value,
-            "object_class": d.class_name,
-            "confidence": d.confidence,
-            "bbox": {
-                "x1": d.bbox[0],
-                "y1": d.bbox[1],
-                "x2": d.bbox[2],
-                "y2": d.bbox[3],
-            },
-            "detected_at": event.timestamp.isoformat(),
-        }
-        q = self.db.table("detection_events").insert(payload)
         await asyncio.to_thread(q.execute)
 
     async def _update_session(self, data: dict) -> None:
@@ -440,8 +556,8 @@ class RunnerRegistry:
 
     async def find_by_camera(self, camera_id: UUID) -> SessionRunner | None:
         """Return the still-running runner currently owning `camera_id`, or
-        None if none. Used by the preview WebSocket to share frames with the
-        runner instead of opening a second VideoCapture on the same device."""
+        None if none. Le WebSocket de preview s'en sert pour partager les
+        frames du runner plutôt que d'ouvrir un second VideoCapture."""
         async with self._lock:
             for runner in self._runners.values():
                 if (
@@ -464,5 +580,9 @@ def registry() -> RunnerRegistry:
     return _REGISTRY
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _utcnow().isoformat()

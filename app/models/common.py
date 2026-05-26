@@ -16,17 +16,10 @@ class YoloModel(str, Enum):
     V11L = "yolov11l"
 
 
-class SessionMode(str, Enum):
-    SINGLE = "single"
-    INTERVAL = "interval"
-
-
 class SessionStatus(str, Enum):
     PENDING = "pending"
-    WAITING_FIRST = "waiting_first"
-    WAITING_SECOND = "waiting_second"
+    MEASURING = "measuring"
     PAUSED = "paused"
-    COMPLETED = "completed"
     STOPPED = "stopped"
     FAILED = "failed"
 
@@ -37,9 +30,10 @@ class UserRole(str, Enum):
     VIEWER = "viewer"
 
 
-class CrossingType(str, Enum):
-    T0 = "T0"
-    T1 = "T1"
+class CadenceStatus(str, Enum):
+    BELOW = "below"
+    NORMAL = "normal"
+    ABOVE = "above"
 
 
 class ORMModel(BaseModel):

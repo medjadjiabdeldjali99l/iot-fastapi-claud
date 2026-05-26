@@ -3,26 +3,29 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.models.common import ORMModel, SessionMode, SessionStatus, YoloModel
+from app.models.common import ORMModel, SessionStatus
 
 
 class SessionBase(BaseModel):
-    mode: SessionMode
-    interval_minutes: int | None = None
+    interval_minutes: int = Field(gt=0)
+    measurement_window_seconds: int = Field(default=120, gt=0)
     anomaly_threshold_pct: float = Field(default=15.0, ge=0)
-    yolo_model_override: YoloModel | None = None
+    # Plage de cadence attendue (OPM). Saisie côté UI dans la config caméra,
+    # mais persistée sur la session. Soit les deux NULL (pas de comparaison),
+    # soit les deux fournies avec min <= max.
+    reference_cadence_min: float | None = Field(default=None, ge=0)
+    reference_cadence_max: float | None = Field(default=None, ge=0)
     notes: str | None = None
 
     @model_validator(mode="after")
-    def _check_interval(self) -> "SessionBase":
-        if self.mode == SessionMode.SINGLE and self.interval_minutes is not None:
-            raise ValueError("interval_minutes must be null for single mode")
-        if self.mode == SessionMode.INTERVAL and (
-            self.interval_minutes is None or self.interval_minutes <= 0
-        ):
+    def _check_reference_cadence(self) -> "SessionBase":
+        mn, mx = self.reference_cadence_min, self.reference_cadence_max
+        if (mn is None) != (mx is None):
             raise ValueError(
-                "interval_minutes must be a positive integer for interval mode"
+                "reference_cadence_min and reference_cadence_max must be both set or both null"
             )
+        if mn is not None and mx is not None and mn > mx:
+            raise ValueError("reference_cadence_min must be <= reference_cadence_max")
         return self
 
 
@@ -47,8 +50,11 @@ class SessionSummary(ORMModel):
     session_id: UUID
     organization_id: UUID
     camera_id: UUID
-    mode: SessionMode
     status: SessionStatus
+    interval_minutes: int
+    measurement_window_seconds: int
+    reference_cadence_min: float | None = None
+    reference_cadence_max: float | None = None
     started_at: datetime | None = None
     ended_at: datetime | None = None
     iteration_count: int
@@ -56,3 +62,6 @@ class SessionSummary(ORMModel):
     min_opm: float | None = None
     max_opm: float | None = None
     anomaly_count: int
+    below_count: int = 0
+    normal_count: int = 0
+    above_count: int = 0

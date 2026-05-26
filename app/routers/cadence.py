@@ -15,16 +15,17 @@ router = APIRouter(prefix="/sessions", tags=["cadence"])
 
 @router.post("", response_model=SessionOut, status_code=status.HTTP_201_CREATED)
 async def create_session(payload: SessionCreate, auth: AuthDep) -> SessionOut:
-    """Create a cadence session and start the runner in the background.
+    """Crée une session de cadence (mode intervalle) et démarre le runner
+    en arrière-plan.
 
-    Mode 'single'   : one iteration (waiting_first → waiting_second → completed).
-    Mode 'interval' : iterations every `interval_minutes` until the operator
-                      calls /stop; each iteration's OPM is flagged as anomaly
-                      when it deviates from the running average by more than
-                      `anomaly_threshold_pct` (default 15%)."""
+    Toutes les `interval_minutes` minutes, le runner ouvre une fenêtre de
+    mesure de `measurement_window_seconds` (défaut 120), collecte les
+    franchissements et calcule la cadence moyenne. Une itération dont l'OPM
+    s'écarte de la moyenne du run de plus de `anomaly_threshold_pct`
+    (défaut 15%) est marquée comme anomalie."""
     cam_q = (
         auth.db.table("cameras")
-        .select("id, stream_url, organization_id")
+        .select("id, name, location, stream_url, organization_id")
         .eq("id", str(payload.camera_id))
         .limit(1)
     )
@@ -32,6 +33,24 @@ async def create_session(payload: SessionCreate, auth: AuthDep) -> SessionOut:
     if not cam_res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Camera not found")
     camera = cam_res.data[0]
+
+    # Méta pour le topic MQTT vers Odoo : on récupère le slug de l'orga
+    # (= factory) en plus du nom et de la location de la caméra (= machine /
+    # line). Best-effort : si la lecture échoue ou que les champs sont vides,
+    # le publisher applique ses fallbacks.
+    org_slug: str | None = None
+    try:
+        org_q = (
+            auth.db.table("organizations")
+            .select("slug")
+            .eq("id", camera["organization_id"])
+            .limit(1)
+        )
+        org_res = await asyncio.to_thread(org_q.execute)
+        if org_res.data:
+            org_slug = org_res.data[0].get("slug")
+    except Exception:
+        pass
 
     cfg_q = (
         auth.db.table("camera_configs")
@@ -48,22 +67,21 @@ async def create_session(payload: SessionCreate, auth: AuthDep) -> SessionOut:
         )
     config = cfg_res.data[0]
 
-    yolo_model = (
-        payload.yolo_model_override.value
-        if payload.yolo_model_override is not None
-        else config["yolo_model"]
-    )
-
     session_payload = {
         "camera_id": str(payload.camera_id),
         "config_id": config["id"],
         "organization_id": camera["organization_id"],
-        "mode": payload.mode.value,
         "interval_minutes": payload.interval_minutes,
+        "measurement_window_seconds": payload.measurement_window_seconds,
         "anomaly_threshold_pct": float(payload.anomaly_threshold_pct),
-        "yolo_model_override": (
-            payload.yolo_model_override.value
-            if payload.yolo_model_override is not None
+        "reference_cadence_min": (
+            float(payload.reference_cadence_min)
+            if payload.reference_cadence_min is not None
+            else None
+        ),
+        "reference_cadence_max": (
+            float(payload.reference_cadence_max)
+            if payload.reference_cadence_max is not None
             else None
         ),
         "status": SessionStatus.PENDING.value,
@@ -84,13 +102,26 @@ async def create_session(payload: SessionCreate, auth: AuthDep) -> SessionOut:
         session_id=session_id,
         camera_id=payload.camera_id,
         stream_url=camera["stream_url"],
-        mode=payload.mode,
         trigger_line_position=float(config["trigger_line_position"]),
         yolo_confidence=float(config["yolo_confidence"]),
-        yolo_model=yolo_model,
+        yolo_model=config["yolo_model"],
         db=auth.db,
         interval_minutes=payload.interval_minutes,
+        measurement_window_seconds=payload.measurement_window_seconds,
         anomaly_threshold_pct=float(payload.anomaly_threshold_pct),
+        reference_cadence_min=(
+            float(payload.reference_cadence_min)
+            if payload.reference_cadence_min is not None
+            else None
+        ),
+        reference_cadence_max=(
+            float(payload.reference_cadence_max)
+            if payload.reference_cadence_max is not None
+            else None
+        ),
+        mqtt_factory=org_slug,
+        mqtt_line=camera.get("location"),
+        mqtt_machine=camera.get("name"),
     )
     await registry().register(session_id, runner)
     runner.start()
@@ -100,8 +131,8 @@ async def create_session(payload: SessionCreate, auth: AuthDep) -> SessionOut:
 
 @router.post("/{session_id}/stop", response_model=SessionOut)
 async def stop_session(session_id: UUID, auth: AuthDep) -> SessionOut:
-    """Cancel a running session. The runner marks the session as
-    'stopped' from inside its CancelledError handler."""
+    """Cancel a running session. Le runner marque la session comme 'stopped'
+    depuis son handler CancelledError."""
     runner = await registry().get(session_id)
     if runner is not None:
         runner.request_stop()

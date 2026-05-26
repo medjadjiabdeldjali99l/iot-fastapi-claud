@@ -1,4 +1,5 @@
 import asyncio
+import os
 from urllib.parse import urlparse
 
 import httpx
@@ -7,9 +8,14 @@ from app.core.config import settings
 
 
 async def ping_stream_url(url: str, timeout: float | None = None) -> bool:
-    """HTTP/HTTPS: HEAD with GET fallback. RTSP: TCP connect on host:port
-    (554 default). Digit string ('0', '1', …): local webcam — reported online
-    here; real availability is verified when the stream is opened."""
+    """Pings a camera source to check availability.
+
+    - Digit string ('0', '1', …): local webcam — reported online, vraie
+      vérification au moment d'ouvrir le flux.
+    - http/https: HEAD avec fallback GET.
+    - rtsp: TCP connect sur host:port (554 par défaut).
+    - file:// ou chemin local : existence du fichier sur disque.
+    """
     if url.isdigit():
         return True
     t = timeout if timeout is not None else settings.CAMERA_PING_TIMEOUT_SECONDS
@@ -20,6 +26,12 @@ async def ping_stream_url(url: str, timeout: float | None = None) -> bool:
         return await _ping_http(url, t)
     if scheme == "rtsp":
         return await _ping_rtsp(parsed.hostname, parsed.port or 554, t)
+    if scheme == "file":
+        return os.path.isfile(url[len("file://"):])
+    # Aucun schéma reconnu (ou un seul caractère, ex. lettre de lecteur
+    # Windows "C:") : on traite comme un chemin local.
+    if scheme == "" or (len(scheme) == 1 and scheme.isalpha()):
+        return os.path.isfile(url)
     return False
 
 
