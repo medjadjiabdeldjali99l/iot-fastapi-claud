@@ -9,6 +9,7 @@ from app.models.camera import CameraCreate, CameraOut, CameraStatusOut, CameraUp
 from app.models.camera_config import CameraConfigCreate, CameraConfigOut
 from app.models.common import CameraStatus
 from app.services.camera_ping import ping_stream_url
+from app.services.mqtt_publisher import publish_camera_config
 
 router = APIRouter(prefix="/cameras", tags=["cameras"])
 
@@ -128,13 +129,14 @@ async def create_config(
     """The DB trigger `deactivate_other_configs` will deactivate the previous active row."""
     cam_q = (
         auth.db.table("cameras")
-        .select("id")
+        .select("id, name, location, organization_id")
         .eq("id", str(camera_id))
         .limit(1)
     )
     cam_res = await asyncio.to_thread(cam_q.execute)
     if not cam_res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Camera not found")
+    camera = cam_res.data[0]
 
     insert_q = auth.db.table("camera_configs").insert(
         {
@@ -152,4 +154,39 @@ async def create_config(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Failed to create config",
         )
-    return CameraConfigOut.model_validate(ins_res.data[0])
+    config = CameraConfigOut.model_validate(ins_res.data[0])
+
+    # Méta pour le topic MQTT vers Odoo (factory/line/machine), même
+    # convention que la publication cadence. Best-effort : si la lecture du
+    # slug d'orga échoue, le publisher applique ses fallbacks.
+    org_slug: str | None = None
+    try:
+        org_q = (
+            auth.db.table("organizations")
+            .select("slug")
+            .eq("id", camera["organization_id"])
+            .limit(1)
+        )
+        org_res = await asyncio.to_thread(org_q.execute)
+        if org_res.data:
+            org_slug = org_res.data[0].get("slug")
+    except Exception:
+        pass
+
+    # Envoi MQTT de l'événement « config sauvegardée ». Best-effort : si
+    # MQTT est désactivé / broker injoignable, l'appel est silencieux et
+    # l'enregistrement de la config reste intact.
+    publish_camera_config(
+        factory=org_slug,
+        line=camera.get("location"),
+        machine=camera.get("name"),
+        camera_id=camera_id,
+        config_id=config.id,
+        trigger_line_position=config.trigger_line_position,
+        yolo_confidence=config.yolo_confidence,
+        yolo_model=config.yolo_model.value,
+        is_active=config.is_active,
+        created_at=config.created_at,
+    )
+
+    return config

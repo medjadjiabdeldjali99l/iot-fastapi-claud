@@ -160,12 +160,13 @@ def _sanitize_topic_segment(value: str | None, fallback: str) -> str:
     return cleaned or fallback
 
 
-def build_cadence_topic(
+def _build_topic(
     factory: str | None,
     line: str | None,
     machine: str | None,
+    subtopic: str,
 ) -> str:
-    """Construit le topic ``{prefix}/{factory}/{line}/{machine}/cadence/iteration``.
+    """Construit ``{prefix}/{factory}/{line}/{machine}/{subtopic}``.
 
     ``factory`` / ``line`` / ``machine`` peuvent être None, auquel cas on
     tombe sur les fallbacks de settings (``MQTT_FACTORY_FALLBACK`` /
@@ -173,7 +174,25 @@ def build_cadence_topic(
     f = _sanitize_topic_segment(factory, settings.MQTT_FACTORY_FALLBACK)
     l = _sanitize_topic_segment(line, settings.MQTT_LINE_FALLBACK)
     m = _sanitize_topic_segment(machine, "unknown")
-    return f"{settings.MQTT_TOPIC_PREFIX}/{f}/{l}/{m}/cadence/iteration"
+    return f"{settings.MQTT_TOPIC_PREFIX}/{f}/{l}/{m}/{subtopic}"
+
+
+def build_cadence_topic(
+    factory: str | None,
+    line: str | None,
+    machine: str | None,
+) -> str:
+    """Topic ``{prefix}/{factory}/{line}/{machine}/cadence/iteration``."""
+    return _build_topic(factory, line, machine, "cadence/iteration")
+
+
+def build_config_topic(
+    factory: str | None,
+    line: str | None,
+    machine: str | None,
+) -> str:
+    """Topic ``{prefix}/{factory}/{line}/{machine}/config/saved``."""
+    return _build_topic(factory, line, machine, "config/saved")
 
 
 def publish_cadence_iteration(
@@ -237,4 +256,66 @@ def publish_cadence_iteration(
         # Ne JAMAIS faire échouer le runner à cause de MQTT.
         logger.warning(
             "MQTT publish a levé une exception (silencieux) : %s", exc
+        )
+
+
+def publish_camera_config(
+    *,
+    factory: str | None,
+    line: str | None,
+    machine: str | None,
+    camera_id: UUID,
+    config_id: UUID,
+    trigger_line_position: float,
+    yolo_confidence: float,
+    yolo_model: str,
+    is_active: bool,
+    created_at: datetime | None = None,
+) -> None:
+    """Publie l'événement « configuration caméra sauvegardée » sur MQTT.
+
+    Même mécanique best-effort que :func:`publish_cadence_iteration` :
+    aucune exception n'est propagée, et si le client est absent (paho non
+    installé / ``MQTT_ENABLED=false`` / init KO) l'appel est un no-op.
+
+    Déclenché à chaque ``Save config`` côté admin (nouvelle ligne active
+    dans ``camera_configs``). Permet à Odoo de connaître les paramètres de
+    détection courants de la caméra (ligne de trigger, modèle, confiance)."""
+    if _client is None:
+        return  # publication désactivée (paho absent, settings off, init KO)
+
+    topic = build_config_topic(factory, line, machine)
+    payload: dict[str, Any] = {
+        "camera_id": str(camera_id),
+        "config_id": str(config_id),
+        "trigger_line_position": trigger_line_position,
+        "yolo_confidence": yolo_confidence,
+        "yolo_model": yolo_model,
+        "is_active": is_active,
+        "created_at": created_at.isoformat() if created_at else None,
+    }
+    body = json.dumps(payload, separators=(",", ":"))
+
+    try:
+        info = _client.publish(
+            topic,
+            payload=body,
+            qos=settings.MQTT_QOS,
+            retain=settings.MQTT_RETAIN,
+        )
+        rc = getattr(info, "rc", 0)
+        if rc != 0:
+            logger.warning(
+                "MQTT publish config a renvoyé rc=%s (topic=%s camera=%s)",
+                rc, topic, camera_id,
+            )
+        else:
+            logger.info(
+                "MQTT publish config OK topic=%s camera=%s model=%s",
+                topic, camera_id, yolo_model,
+            )
+    except Exception as exc:
+        # Ne JAMAIS faire échouer l'enregistrement de config à cause de MQTT.
+        logger.warning(
+            "MQTT publish config a levé une exception (silencieux) : %s", exc
         )
