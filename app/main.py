@@ -20,6 +20,9 @@ logging.basicConfig(
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)  # polls du frontend
 for noisy in ("httpx", "httpcore", "hpack", "h2"):              # appels REST Supabase
     logging.getLogger(noisy).setLevel(logging.WARNING)
+# Mais on veut VOIR les logs MQTT (connexion, publish OK, déconnexion) qui sont
+# émis en INFO — sinon on a l'impression que rien ne se passe.
+logging.getLogger("app.services.mqtt_publisher").setLevel(logging.INFO)
 
 
 @asynccontextmanager

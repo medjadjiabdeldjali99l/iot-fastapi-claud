@@ -121,7 +121,19 @@ class RTSPStream:
             raise StreamUnavailable(f"Cannot open stream: {self.url}")
         self._cap = cap
 
-        interval = 1.0 / self.target_fps
+        # Cadence de lecture. Pour un fichier vidéo on respecte le fps NATIF du
+        # fichier : sinon, à target_fps=10, une vidéo enregistrée à 25/30 fps
+        # défile ~3× trop lentement (on ne pioche que 10 images/s). Pour une
+        # webcam / flux réseau, comportement inchangé (target_fps).
+        if self._is_file:
+            native_fps = await asyncio.to_thread(cap.get, cv2.CAP_PROP_FPS)
+            interval = (
+                1.0 / native_fps
+                if native_fps and 1.0 <= native_fps <= 120.0
+                else 1.0 / self.target_fps
+            )
+        else:
+            interval = 1.0 / self.target_fps
         try:
             while True:
                 ret, frame = await asyncio.to_thread(cap.read)
