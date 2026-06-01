@@ -30,6 +30,27 @@ class Settings(BaseSettings):
     YOLO_DEFAULT_MODEL: str = "yolov8n"
     YOLO_DEFAULT_CONFIDENCE: float = 0.5
 
+    # Moteur de détection utilisé pour le comptage / la cadence :
+    #   "yolo"   → réseau Ultralytics + ByteTrack (précis, lourd sur CPU/Pi)
+    #   "opencv" → vision classique MOG2 + contours + centroid tracker (léger,
+    #              temps réel sur Pi). Voir services/detection_opencv.py.
+    # Bascule sans toucher au code, juste via .env. Interface identique des
+    # deux côtés, donc le reste du runner ne change pas.
+    DETECTOR_BACKEND: str = "yolo"
+
+    # --- Réglages du détecteur OpenCV (ignorés si DETECTOR_BACKEND=yolo) ---
+    # Tunables sans recompiler — voir services/detection_opencv.py.
+    # Filtrage des contours (en px²) :
+    OPENCV_MIN_AREA: int = 500          # aire mini d'un blob pour le garder
+    OPENCV_MAX_AREA: int = 0            # aire maxi (0 = pas de plafond)
+    # Soustraction de fond MOG2 :
+    OPENCV_MOG2_HISTORY: int = 500      # nb de frames pour modéliser le fond
+    OPENCV_MOG2_VAR_THRESHOLD: float = 16.0  # sensibilité (bas = + sensible)
+    OPENCV_MOG2_DETECT_SHADOWS: bool = True  # marquer/retirer les ombres
+    # Centroid tracker :
+    OPENCV_TRACK_MAX_DISAPPEARED: int = 30   # frames d'absence avant oubli d'un id
+    OPENCV_TRACK_MAX_DISTANCE: float = 80.0  # distance max (px) pour réassocier un id
+
     ANOMALY_THRESHOLD_PCT: float = 15.0
     CAMERA_PING_TIMEOUT_SECONDS: float = 3.0
 

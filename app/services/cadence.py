@@ -28,8 +28,10 @@ from uuid import UUID
 
 from supabase import Client
 
+from app.core.config import settings
 from app.models.common import CadenceStatus, SessionStatus
 from app.services.detection import Detection, YoloDetector
+from app.services.detection_opencv import OpenCvDetector
 from app.services.mqtt_publisher import publish_cadence_iteration
 from app.services.stream import RTSPStream, StreamUnavailable
 from app.services.tracking import LineCrosser
@@ -94,6 +96,26 @@ def compute_cadence_status(
     if opm > ref_max:
         return CadenceStatus.ABOVE
     return CadenceStatus.NORMAL
+
+
+def make_detector(yolo_model: str) -> YoloDetector | OpenCvDetector:
+    """Retourne le détecteur selon `settings.DETECTOR_BACKEND`.
+
+    Les deux backends exposent la MÊME interface (`track`/`detect` ->
+    list[Detection] avec tracker_id), donc le reste du runner est agnostique.
+    Défaut = YOLO ; `DETECTOR_BACKEND=opencv` bascule sur la vision classique."""
+    backend = (settings.DETECTOR_BACKEND or "yolo").strip().lower()
+    if backend == "opencv":
+        return OpenCvDetector(
+            min_area=settings.OPENCV_MIN_AREA,
+            max_area=settings.OPENCV_MAX_AREA or None,  # 0 → pas de plafond
+            history=settings.OPENCV_MOG2_HISTORY,
+            var_threshold=settings.OPENCV_MOG2_VAR_THRESHOLD,
+            detect_shadows=settings.OPENCV_MOG2_DETECT_SHADOWS,
+            max_disappeared=settings.OPENCV_TRACK_MAX_DISAPPEARED,
+            max_distance=settings.OPENCV_TRACK_MAX_DISTANCE,
+        )
+    return YoloDetector(yolo_model)
 
 
 class SessionRunner:
@@ -200,7 +222,11 @@ class SessionRunner:
                 pass
 
     async def _run_interval(self) -> None:
-        print(f">>> RUNNER START session={self.session_id} stream={self.stream_url}", flush=True)
+        print(
+            f">>> RUNNER START session={self.session_id} stream={self.stream_url} "
+            f"detector={settings.DETECTOR_BACKEND}",
+            flush=True,
+        )
         iteration_number = 0
         while not self._stop_requested:
             iteration_number += 1
@@ -209,7 +235,7 @@ class SessionRunner:
             # Nouveau détecteur + crosser par itération : ByteTrack persiste son
             # état entre appels, repartir à zéro garantit des IDs propres après
             # la pause.
-            detector = YoloDetector(self.yolo_model)
+            detector = make_detector(self.yolo_model)
             crosser = LineCrosser(self.trigger_line_position)
             stream = RTSPStream(self.stream_url, target_fps=self.target_fps)
             iteration_id = await self._create_iteration(iteration_number)
@@ -303,7 +329,7 @@ class SessionRunner:
     async def _collect_window(
         self,
         stream: RTSPStream,
-        detector: YoloDetector,
+        detector: YoloDetector | OpenCvDetector,
         crosser: LineCrosser,
         window_start: datetime,
         iteration_number: int,
