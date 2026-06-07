@@ -185,6 +185,14 @@ class OpenCvDetector:
         boxes: list[tuple[float, float, float, float]] = []
         for c in contours:
             area = cv2.contourArea(c)
+            # --- LOG DE CALIBRATION (temporaire) : affiche l'aire de CHAQUE
+            # contour détecté + les bornes courantes. Sert à choisir
+            # OPENCV_MIN_AREA / OPENCV_MAX_AREA. À retirer une fois réglé.
+            print(
+                f"[opencv] contour area={area:.0f} px2 "
+                f"(min={self.min_area} max={self.max_area})",
+                flush=True,
+            )
             if area < self.min_area:
                 continue
             if self.max_area is not None and area > self.max_area:
